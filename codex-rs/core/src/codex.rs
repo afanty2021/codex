@@ -77,6 +77,7 @@ use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::compact::collect_user_messages;
 use crate::config::Config;
+use crate::config::GhostSnapshotConfig;
 use crate::config::types::ShellEnvironmentPolicy;
 use crate::context_manager::ContextManager;
 use crate::environment_context::EnvironmentContext;
@@ -364,6 +365,7 @@ pub(crate) struct TurnContext {
     pub(crate) sandbox_policy: SandboxPolicy,
     pub(crate) shell_environment_policy: ShellEnvironmentPolicy,
     pub(crate) tools_config: ToolsConfig,
+    pub(crate) ghost_snapshot: GhostSnapshotConfig,
     pub(crate) final_output_json_schema: Option<Value>,
     pub(crate) codex_linux_sandbox_exe: Option<PathBuf>,
     pub(crate) tool_call_gate: Arc<ReadinessFlag>,
@@ -525,6 +527,7 @@ impl Session {
             sandbox_policy: session_configuration.sandbox_policy.clone(),
             shell_environment_policy: per_turn_config.shell_environment_policy.clone(),
             tools_config,
+            ghost_snapshot: per_turn_config.ghost_snapshot.clone(),
             final_output_json_schema: None,
             codex_linux_sandbox_exe: per_turn_config.codex_linux_sandbox_exe.clone(),
             tool_call_gate: Arc::new(ReadinessFlag::new()),
@@ -2070,6 +2073,7 @@ async fn spawn_review_thread(
         sub_id: sub_id.to_string(),
         client,
         tools_config,
+        ghost_snapshot: parent_turn_context.ghost_snapshot.clone(),
         developer_instructions: None,
         user_instructions: None,
         base_instructions: Some(base_instructions.clone()),
@@ -2472,6 +2476,7 @@ async fn try_run_turn(
     let mut needs_follow_up = false;
     let mut last_agent_message: Option<String> = None;
     let mut active_item: Option<TurnItem> = None;
+    let mut should_emit_turn_diff = false;
     let receiving_span = info_span!("receiving_stream");
     let outcome: CodexResult<TurnRunResult> = loop {
         let handle_responses = info_span!(
@@ -2547,14 +2552,7 @@ async fn try_run_turn(
             } => {
                 sess.update_token_usage_info(&turn_context, token_usage.as_ref())
                     .await;
-                let unified_diff = {
-                    let mut tracker = turn_diff_tracker.lock().await;
-                    tracker.get_unified_diff()
-                };
-                if let Ok(Some(unified_diff)) = unified_diff {
-                    let msg = EventMsg::TurnDiff(TurnDiffEvent { unified_diff });
-                    sess.send_event(&turn_context, msg).await;
-                }
+                should_emit_turn_diff = true;
 
                 break Ok(TurnRunResult {
                     needs_follow_up,
@@ -2628,7 +2626,18 @@ async fn try_run_turn(
         }
     };
 
-    drain_in_flight(&mut in_flight, sess, turn_context).await?;
+    drain_in_flight(&mut in_flight, sess.clone(), turn_context.clone()).await?;
+
+    if should_emit_turn_diff {
+        let unified_diff = {
+            let mut tracker = turn_diff_tracker.lock().await;
+            tracker.get_unified_diff()
+        };
+        if let Ok(Some(unified_diff)) = unified_diff {
+            let msg = EventMsg::TurnDiff(TurnDiffEvent { unified_diff });
+            sess.clone().send_event(&turn_context, msg).await;
+        }
+    }
 
     outcome
 }
